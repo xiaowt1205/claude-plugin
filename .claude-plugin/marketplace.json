@@ -1,0 +1,33 @@
+{
+  "name": "xiaowt-plugins",
+  "description": "Justin 的 Claude Code 私人 plugin marketplace",
+  "owner": {
+    "name": "Justin",
+    "email": "justin.xiao@wanin.tw"
+  },
+  "metadata": {
+    "version": "0.1.0"
+  },
+  "plugins": [
+    {
+      "name": "hello-world",
+      "source": "./plugins/hello-world",
+      "description": "範例 plugin：一個打招呼的 skill，用來驗證 marketplace 流程",
+      "category": "example",
+      "tags": [
+        "example",
+        "template"
+      ]
+    },
+    {
+      "name": "todo-tasks",
+      "source": "./plugins/todo-tasks",
+      "description": "任務卡片佇列：設定處理規範，新增任務卡片（標題＋內容），啟動後依序逐一交給模型處理",
+      "category": "productivity",
+      "tags": [
+        "mod",
+        "task-queue"
+      ]
+    }
+  ]
+}

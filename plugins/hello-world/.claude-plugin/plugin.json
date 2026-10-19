@@ -1,0 +1,9 @@
+{
+  "name": "hello-world",
+  "version": "0.1.0",
+  "description": "範例 plugin：一個打招呼的 skill，用來驗證 marketplace 流程",
+  "author": {
+    "name": "Justin",
+    "email": "justin.xiao@wanin.tw"
+  }
+}
