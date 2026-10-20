@@ -149,29 +149,20 @@ function newId() {
 
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
-    // hot-reload 也會再跑一次 session.start：面板已顯示過就不要再彈
-    const first = !(await read($, isInitialized))
+    // hot-reload 也會再跑一次 session.start
     await load($)
     await update($, isRunning, () => false)
-    if (first) {
-      void openPane($).then(r => {
-        if (!r.isPlaced) $.ui.log(`todo-tasks: 面板尚未顯示（${r.reason}）`)
-      })
-    }
+    // 不自動彈出面板：只在使用者下 /todo-tasks（或按 prompt 上方的重開列）時開啟
+    await $.command.register({
+      name: 'todo-tasks',
+      description: '開啟任務佇列面板（任務卡片依序交給模型處理）',
+    })
     return next(e)
   })
 
-  // session.start 主動開的面板在窄視窗不會被畫出來（要 ≥144 欄）；
-  // 使用者送出的第一則 prompt 算「被要求」的開啟，任何寬度都會放置，所以在那時再開一次。
-  // 只做在面板還沒顯示過、也沒被關過的時候（isPaneSeen）
-  on('prompt.submit', async ($, e, next) => {
-    // 先讓 prompt 通過，再開面板：在 next 之前改 state 會讓佇列的下一則 submit 丟失
-    const result = await next(e)
-    if (!e.isMeta && !e.command && !(await read($, isPaneSeen))) {
-      await update($, isPaneSeen, () => true)
-      if (!(await read($, isPaneOpen))) await openPane($)
-    }
-    return result
+  on('command.run', { command: 'todo-tasks' }, async $ => {
+    const r = await openPane($, true)
+    return { text: r.isPlaced ? '任務佇列面板已開啟。' : `任務佇列面板尚未顯示（${r.reason}）` }
   })
 
   // 面板被關掉後，prompt 上方留一條可重新開啟的列；關過就不再自動彈出
@@ -183,9 +174,11 @@ export const register: Register = on => {
 
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
     if (e.props.hasSurvey || (await read($, isPaneOpen))) return next(e)
-    const { Box, Text, Button } = $.ui.resolve(e)
     const list = await read($, tasks)
     const running = await read($, isRunning)
+    // 沒有任務也沒在跑：不佔 prompt 上方的空間（要開面板用 /todo-tasks）
+    if (list.length === 0 && !running) return next(e)
+    const { Box, Text, Button } = $.ui.resolve(e)
     const done = list.filter(t => t.status === 'done').length
     return (
       <Box gap={1}>
