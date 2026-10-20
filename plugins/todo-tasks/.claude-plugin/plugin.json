@@ -1,6 +1,6 @@
 {
   "name": "todo-tasks",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "任務卡片佇列：設定處理規範，新增任務卡片（標題＋內容），啟動後依序逐一交給模型處理",
   "types": "./types/index.d.ts"
 }
