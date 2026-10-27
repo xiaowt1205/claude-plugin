@@ -295,10 +295,7 @@ export const register: Register = on => {
       <Box flexDirection="column" width={width} gap={1}>
         {/* 處理規範：常駐輸入欄，Enter 儲存 */}
         <Box flexDirection="column" borderStyle="round" borderColor="subtle" paddingX={1} gap={0}>
-          <Box justifyContent="space-between">
-            <Text weight="bold">處理規範</Text>
-            <Text dimColor size="caption">每則任務都會附上，只在本 session 有效</Text>
-          </Box>
+          <Text weight="bold">處理規範</Text>
           <Input
             key="rules"
             placeholder={DEFAULT_RULES}
@@ -311,12 +308,6 @@ export const register: Register = on => {
               $.ui.toast('規範已儲存')
             }}
           />
-          {/* Input 是單行元件拉不高：下方用可換行文字把全文顯示出來 */}
-          {ruleText.trim() !== '' && (
-            <Box paddingX={1} marginTop={1} borderStyle="single" borderColor="subtle" borderDimColor>
-              <Text wrap="wrap">{ruleText}</Text>
-            </Box>
-          )}
           <Box justifyContent="space-between" alignItems="center" marginTop={1}>
             <Text weight="bold">Skill</Text>
             {draft === null && (
