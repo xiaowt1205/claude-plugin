@@ -143,6 +143,19 @@ async function stop($: $) {
   $.ui.toast('已停止任務佇列')
 }
 
+// 多行欄位依內容長高：每個實際換行各算一行，過長的行再依欄寬折行；夾在 min～max 之間
+function autoRows(text: string, columns: number, min: number, max: number) {
+  const cols = Math.max(10, columns)
+  let lines = 0
+  for (const line of (text || '').split('\n')) {
+    // 以顯示寬度估算：CJK 等全形字算 2 格
+    let w = 0
+    for (const ch of line) w += /[\u1100-\u11ff\u2e80-\ua4cf\uac00-\ud7a3\uf900-\ufaff\ufe30-\ufe4f\uff00-\uff60\uffe0-\uffe6]/.test(ch) ? 2 : 1
+    lines += Math.max(1, Math.ceil(w / cols))
+  }
+  return Math.min(max, Math.max(min, lines))
+}
+
 function newId() {
   return `t${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`
 }
@@ -290,7 +303,7 @@ export const register: Register = on => {
             key="rules"
             placeholder={DEFAULT_RULES}
             value={ruleText}
-            rows={4}
+            rows={autoRows(ruleText, width - 4, 2, 12)}
             submitLabel="儲存"
             onInput={v => update($, rules, () => v)}
             onSubmit={async v => {
@@ -420,7 +433,7 @@ export const register: Register = on => {
               label="內容"
               placeholder="要做什麼、涉及哪些檔案、完成條件"
               value={task.content}
-              rows={5}
+              rows={autoRows(task.content, width - 4 - 5, 2, 15)}
               onInput={v => setTask(task.id, { content: v })}
               onSubmit={v => setTask(task.id, { content: v })}
             />
