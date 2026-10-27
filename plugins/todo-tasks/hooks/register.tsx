@@ -290,6 +290,7 @@ export const register: Register = on => {
             key="rules"
             placeholder={DEFAULT_RULES}
             value={ruleText}
+            rows={4}
             submitLabel="儲存"
             onInput={v => update($, rules, () => v)}
             onSubmit={async v => {
@@ -419,6 +420,7 @@ export const register: Register = on => {
               label="內容"
               placeholder="要做什麼、涉及哪些檔案、完成條件"
               value={task.content}
+              rows={5}
               onInput={v => setTask(task.id, { content: v })}
               onSubmit={v => setTask(task.id, { content: v })}
             />
