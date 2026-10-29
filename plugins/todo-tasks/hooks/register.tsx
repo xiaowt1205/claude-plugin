@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 
-import type { Task } from '../types'
+import type { RunMode, Task } from '../types'
 
 const PLUGIN = 'todo-tasks'
 const PANE = 'todo-tasks'
@@ -17,6 +17,10 @@ const fileDraft = atom(
   null as { id: string; text: string } | null,
 )
 const tasks = atom({ plugin: 'todo-tasks', key: 'tasks' } as const, [] as Task[])
+// 執行順序：linear = 一張接一張（預設）；parallel = 每張卡片各派一個 subagent 同時處理
+const runMode = atom({ plugin: 'todo-tasks', key: 'runMode' } as const, 'linear' as RunMode)
+// 同步模式：subagent id → 任務卡片 id（turn.complete 靠它認出是哪張卡片）
+const agentMap = atom({ plugin: 'todo-tasks', key: 'agentMap' } as const, {} as Record<string, string>)
 const isRunning = atom({ plugin: 'todo-tasks', key: 'isRunning' } as const, false)
 const isPaneOpen = atom({ plugin: 'todo-tasks', key: 'isPaneOpen' } as const, false)
 // 這個 session 面板是否已經顯示過或被使用者關過：是的話就不再自動彈出（跨 hot-reload 保留）
@@ -69,7 +73,30 @@ async function load($: $) {
   await update($, skillDraft, () => null)
   await update($, fileDraft, () => null)
   await update($, tasks, () => [])
+  await update($, runMode, () => 'linear')
+  await update($, agentMap, () => ({}))
   await update($, isInitialized, () => true)
+}
+
+// 同步模式任務訊息裡的卡片標記：turn.start 看到它就能把 subagent 對應回卡片
+const TASK_MARK = '[todo-tasks:'
+
+// 模型回報進度用的工具：完整名稱 mcp__todo-tasks__progress
+const PROGRESS_TOOL = 'progress'
+const PROGRESS_TOOL_FULL = `mcp__${PLUGIN}__${PROGRESS_TOOL}`
+const PROGRESS_HINT =
+  `處理過程中請用 ${PROGRESS_TOOL_FULL} 工具回報進度（percent 0～100 與一句 note），` +
+  `至少在：開始分析後、主要修改完成、驗證/測試完成、回報結果前各呼叫一次。`
+
+const RUN_MODE_OPTIONS: readonly { value: RunMode; label: string }[] = [
+  { value: 'linear', label: '線性' },
+  { value: 'parallel', label: '同步' },
+]
+
+const RUN_MODE_LABEL: Record<RunMode, string> = { linear: '線性', parallel: '同步' }
+
+function isRunMode(v: string): v is RunMode {
+  return v === 'linear' || v === 'parallel'
 }
 
 // `.claude/skills/foo/SKILL.md`、`foo/` 或 `foo.md` → `foo`
@@ -97,19 +124,118 @@ function rulesText(ruleText: string, skillList: string[]) {
   return parts.join('\n\n')
 }
 
-function buildPrompt(ruleText: string, task: Task, index: number, total: number) {
+function buildPrompt(ruleText: string, task: Task, index: number, total: number, mode: RunMode = 'linear') {
   const rulesPart = ruleText ? `## 任務處理規範\n${ruleText}\n\n` : ''
+  const tail =
+    mode === 'parallel'
+      ? `請嚴格依照上述規範處理這個任務。這個任務與佇列中其他任務正由不同的 subagent 同時處理，` +
+        `只負責自己這一項、不要動其他任務的範圍。完成後請簡短回報結果（做了什麼、改了哪些檔案、有無問題）。`
+      : `請嚴格依照上述規範處理這個任務。完成後請簡短回報結果；` +
+        `這是佇列中的第 ${index + 1} 個任務，回報後會自動開始下一個。`
   return (
-    `【TodoTasks 任務 ${index + 1}/${total}】\n\n` +
+    `【TodoTasks 任務 ${index + 1}/${total}】` +
+    (mode === 'parallel' ? `${TASK_MARK}${task.id}]` : '') +
+    `\n\n` +
     rulesPart +
     `## 任務標題\n${task.title.trim() || '（未命名）'}\n\n` +
     `## 任務內容\n${task.content.trim() || '（無內容）'}\n\n` +
     (task.files.length
       ? `## 附加檔案 / 網址\n處理前請先讀取（本機路徑用 Read，網址用 WebFetch）：\n${task.files.map(f => `- ${f}`).join('\n')}\n\n`
       : '') +
-    `請嚴格依照上述規範處理這個任務。完成後請簡短回報結果；` +
-    `這是佇列中的第 ${index + 1} 個任務，回報後會自動開始下一個。`
+    `## 進度回報\n${PROGRESS_HINT}\n\n` +
+    tail
   )
+}
+
+// 卡片進入執行中：清掉上一輪的進度與計數
+function startFields(): Partial<Task> {
+  return { status: 'running', result: undefined, progress: { percent: 0 }, toolCalls: 0 }
+}
+
+// 哪張卡片在呼叫工具：同步模式看 agentId 對應；線性模式就是唯一執行中的那張
+async function taskOfCall($: $, agentId: string | undefined) {
+  const map = await read($, agentMap)
+  const list = await read($, tasks)
+  if (Object.keys(map).length) return agentId ? list.find(t => t.id === map[agentId]) : undefined
+  return list.find(t => t.status === 'running')
+}
+
+function clampPercent(v: unknown) {
+  const n = typeof v === 'number' ? v : Number(v)
+  if (!Number.isFinite(n)) return undefined
+  return Math.max(0, Math.min(100, Math.round(n)))
+}
+
+// 文字進度條：[██████░░░░] 60%
+function progressBar(percent: number, cells: number) {
+  const n = Math.max(4, cells)
+  const filled = Math.round((percent / 100) * n)
+  return { filled: '█'.repeat(filled), empty: '░'.repeat(n - filled) }
+}
+
+// 同步模式：所有待處理卡片各派一個 subagent，同時開跑
+async function startParallel($: $) {
+  const list = await read($, tasks)
+  const pending = list.filter(t => t.status === 'pending')
+  const ruleText = rulesText(await read($, rules), await read($, skills))
+  await update($, agentMap, () => ({}))
+  await update($, tasks, l =>
+    l.map(t => (t.status === 'pending' ? { ...t, ...startFields() } : t)),
+  )
+  $.ui.status(`同步處理 ${pending.length} 個任務…`)
+
+  let started = 0
+  for (const task of pending) {
+    const index = list.findIndex(t => t.id === task.id)
+    const r = await $.agent.spawn({
+      prompt: buildPrompt(ruleText, task, index, list.length, 'parallel'),
+      description: `TodoTasks ${index + 1}/${list.length}：${task.title.trim() || '（未命名）'}`,
+      subagentType: 'general-purpose',
+    })
+    if (r.deny !== undefined) {
+      await update($, tasks, l =>
+        l.map(t => (t.id === task.id ? { ...t, status: 'failed', result: `無法啟動 subagent：${r.deny}` } : t)),
+      )
+      continue
+    }
+    // 引擎給了 agentId 就直接對應；沒有的話由 turn.start 依訊息裡的標記補上
+    const agentId = r.agentId
+    if (agentId) await update($, agentMap, m => ({ ...m, [agentId]: task.id }))
+    started++
+  }
+
+  if (started === 0) {
+    await update($, isRunning, () => false)
+    $.ui.status(undefined)
+    $.ui.toast('沒有任何 subagent 啟動，佇列已停止')
+    return
+  }
+  $.ui.toast(`已派出 ${started} 個 subagent 同時處理`)
+}
+
+// 同步模式全部回報後：把各 subagent 的結果彙整成一則訊息交給主模型總結
+async function finishParallel($: $) {
+  const list = await read($, tasks)
+  const done = list.filter(t => t.status === 'done' || t.status === 'failed')
+  await update($, isRunning, () => false)
+  await update($, agentMap, () => ({}))
+  $.ui.status(undefined)
+  $.ui.toast('同步任務全部完成')
+  const report = done
+    .map((t, i) => {
+      const index = list.findIndex(x => x.id === t.id)
+      return (
+        `### ${index + 1}. ${t.title.trim() || '（未命名）'}（${STATUS_LABEL[t.status]}）\n` +
+        (t.result?.trim() || '（沒有回報內容）')
+      )
+    })
+    .join('\n\n')
+  void $.prompt.submit({
+    text:
+      `【TodoTasks 同步執行結果】\n\n以下是 ${done.length} 個任務各自由 subagent 同時處理後的回報。` +
+      `請彙整成一份簡短總結（每個任務一兩句：做了什麼、有無問題），不要重做任務。\n\n${report}`,
+    asUser: true,
+  })
 }
 
 async function runNext($: $): Promise<boolean> {
@@ -117,7 +243,7 @@ async function runNext($: $): Promise<boolean> {
   const index = list.findIndex(t => t.status === 'pending')
   if (index < 0) return false
   const task = list[index]!
-  await update($, tasks, l => l.map(t => (t.id === task.id ? { ...t, status: 'running' } : t)))
+  await update($, tasks, l => l.map(t => (t.id === task.id ? { ...t, ...startFields() } : t)))
   $.ui.status(`任務 ${index + 1}/${list.length}：${task.title || '（未命名）'}`)
   void $.prompt.submit({
     text: buildPrompt(rulesText(await read($, rules), await read($, skills)), task, index, list.length),
@@ -133,14 +259,21 @@ async function start($: $) {
     return
   }
   await update($, isRunning, () => true)
+  if ((await read($, runMode)) === 'parallel') {
+    await startParallel($)
+    return
+  }
   await runNext($)
 }
 
 async function stop($: $) {
+  const parallel = Object.keys(await read($, agentMap)).length > 0
   await update($, isRunning, () => false)
+  await update($, agentMap, () => ({}))
   await update($, tasks, l => l.map(t => (t.status === 'running' ? { ...t, status: 'pending' } : t)))
   $.ui.status(undefined)
-  $.ui.toast('已停止任務佇列')
+  // subagent 沒有中止 API：已派出的會跑完，但回報不再寫回卡片
+  $.ui.toast(parallel ? '已停止：已派出的 subagent 會自行跑完，結果不再記錄' : '已停止任務佇列')
 }
 
 // 多行欄位依內容長高：每個實際換行各算一行，過長的行再依欄寬折行；夾在 min～max 之間
@@ -166,6 +299,20 @@ export const register: Register = on => {
     await load($)
     await update($, isRunning, () => false)
     // 不自動彈出面板：只在使用者下 /todo-tasks（或按 prompt 上方的重開列）時開啟
+    await $.tool.register({
+      name: PROGRESS_TOOL,
+      description:
+        '回報目前 TodoTasks 任務的進度：percent（0～100）與一句 note。處理任務卡片時在每個階段呼叫，面板會顯示進度條。',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          percent: { type: 'number', minimum: 0, maximum: 100, description: '完成百分比 0～100' },
+          note: { type: 'string', description: '一句話說明目前在做什麼' },
+        },
+        required: ['percent'],
+      },
+      isDeferred: false,
+    })
     await $.command.register({
       name: 'todo-tasks',
       description: '開啟任務佇列面板（任務卡片依序交給模型處理）',
@@ -218,23 +365,99 @@ export const register: Register = on => {
           text:
             `# TodoTasks 任務處理規範\n` +
             `使用者透過「任務佇列」面板逐一送出任務（訊息以【TodoTasks 任務 i/N】開頭）。` +
-            `處理這些任務時必須遵守以下規範：\n\n${text}`,
+            `處理這些任務時必須遵守以下規範，並用 ${PROGRESS_TOOL_FULL} 工具回報進度：\n\n${text}`,
         },
       ],
     }
   })
 
+  // 模型回報進度 → 寫到對應卡片
+  on('tool.call', { tool: PROGRESS_TOOL_FULL }, async ($, e) => {
+    const percent = clampPercent(e.percent)
+    if (percent === undefined) {
+      const msg = 'percent 必須是 0～100 的數字'
+      return { isError: true, result: msg, text: msg }
+    }
+    const note = typeof e.note === 'string' ? e.note.trim() : ''
+    const task = (await read($, isRunning)) ? await taskOfCall($, e.agentId) : undefined
+    if (!task) return { result: '目前沒有執行中的任務卡片，已忽略', text: '目前沒有執行中的任務卡片，已忽略' }
+    await update($, tasks, l =>
+      l.map(t => (t.id === task.id ? { ...t, progress: { percent, ...(note ? { note } : {}) } } : t)),
+    )
+    return { result: 'ok', text: `已記錄進度 ${percent}%` }
+  })
+
+  // 任何工具呼叫 → 對應卡片的活動計數 +1
+  on('tool.call', async ($, e, next) => {
+    if (e.tool !== PROGRESS_TOOL_FULL && (await read($, isRunning))) {
+      const task = await taskOfCall($, e.agentId)
+      if (task) {
+        await update($, tasks, l => l.map(t => (t.id === task.id ? { ...t, toolCalls: (t.toolCalls ?? 0) + 1 } : t)))
+      }
+    }
+    return next(e)
+  })
+
+  // 同步模式：subagent 的第一個 turn 以我們的任務訊息開頭 → 記下 agentId ↔ 卡片
+  on('turn.start', async ($, e, next) => {
+    if (!e.agentId || !(await read($, isRunning))) return next(e)
+    const at = e.text.indexOf(TASK_MARK)
+    if (at < 0) return next(e)
+    const taskId = e.text.slice(at + TASK_MARK.length, e.text.indexOf(']', at))
+    const list = await read($, tasks)
+    const map = await read($, agentMap)
+    const task = list.find(t => t.id === taskId)
+    if (task?.status === 'running' && !Object.values(map).includes(taskId)) {
+      await update($, agentMap, m => ({ ...m, [e.agentId!]: taskId }))
+    }
+    return next(e)
+  })
+
   // 一個任務的 turn 結束 → 標記完成，接著送出下一個
   on('turn.complete', async ($, e, next) => {
     const result = await next(e)
-    if (e.agentId || !(await read($, isRunning))) return result
+    if (!(await read($, isRunning))) return result
+
+    // 同步模式：某個 subagent 回報了 → 寫回對應卡片；全部回報後彙整
+    if (e.agentId) {
+      const map = await read($, agentMap)
+      const taskId = map[e.agentId]
+      if (!taskId) return result
+      const ok = e.reason === 'answer'
+      await update($, tasks, l =>
+        l.map(t =>
+          t.id === taskId
+            ? {
+                ...t,
+                status: ok ? 'done' : 'failed',
+                progress: ok ? { percent: 100 } : t.progress,
+                result: ok ? e.answer : `中斷（${e.reason}）${e.answer ? `\n${e.answer}` : ''}`,
+              }
+            : t,
+        ),
+      )
+      await update($, agentMap, m => {
+        const { [e.agentId!]: _, ...rest } = m
+        return rest
+      })
+      const remaining = Object.keys(await read($, agentMap)).length
+      const list = await read($, tasks)
+      const finished = list.filter(t => t.status !== 'pending' && t.status !== 'running').length
+      $.ui.status(remaining ? `同步處理中：${finished}/${list.length} 已回報` : undefined)
+      if (!remaining) await finishParallel($)
+      return result
+    }
+    // 同步模式進行中，主迴圈的 turn（例如使用者另外打字）與卡片無關
+    if (Object.keys(await read($, agentMap)).length) return result
     const list = await read($, tasks)
     const current = list.find(t => t.status === 'running')
     if (!current) return result
 
     const ok = e.reason === 'answer'
     await update($, tasks, l =>
-      l.map(t => (t.id === current.id ? { ...t, status: ok ? 'done' : 'failed' } : t)),
+      l.map(t =>
+        t.id === current.id ? { ...t, status: ok ? 'done' : 'failed', progress: ok ? { percent: 100 } : t.progress } : t,
+      ),
     )
 
     if (!ok) {
@@ -257,6 +480,7 @@ export const register: Register = on => {
     const list = await read($, tasks)
     const ruleText = await read($, rules)
     const running = await read($, isRunning)
+    const parallelRunning = running && Object.keys(await read($, agentMap)).length > 0
     const skillList = await read($, skills)
     const draft = await read($, skillDraft)
     const fDraft = await read($, fileDraft)
@@ -274,6 +498,14 @@ export const register: Register = on => {
                 {STATUS_MARK[task.status]} {i + 1}. {task.title || '（未命名）'}
               </Text>
               <Text dimColor>{task.content}</Text>
+              {task.status === 'running' && (
+                <Text color="claude" size="caption">
+                  {progressBar(task.progress?.percent ?? 0, 16).filled}
+                  <Text dimColor>{progressBar(task.progress?.percent ?? 0, 16).empty}</Text>
+                  {' '}{task.progress?.percent ?? 0}%{task.progress?.note ? `　${task.progress.note}` : ''}
+                </Text>
+              )}
+              {task.result && <Text size="caption">↳ {task.result}</Text>}
             </Box>
           ))}
           {running ? (
@@ -281,12 +513,15 @@ export const register: Register = on => {
           ) : (
             <Button key="start" variant="primary" label="▶ 啟動任務" onPress={() => start($)} />
           )}
-          <Text dimColor>{done}/{list.length} 完成</Text>
+          <Text dimColor>
+            {done}/{list.length} 完成　執行順序：{RUN_MODE_LABEL[await read($, runMode)]}
+          </Text>
         </Box>
       )
     }
 
-    const { Box, Text, Button, Input } = $.ui.resolve(e)
+    const { Box, Text, Button, Input, Select } = $.ui.resolve(e)
+    const mode = await read($, runMode)
 
     const setTask = (id: string, patch: Partial<Task>) =>
       update($, tasks, l => l.map(t => (t.id === id ? { ...t, ...patch } : t)))
@@ -371,7 +606,7 @@ export const register: Register = on => {
             <Text dimColor>
               {list.length === 0 ? '（空）' : `${done}/${list.length} 完成`}
             </Text>
-            {running && <Text color="claude">　● 執行中</Text>}
+            {running && <Text color="claude">　● {parallelRunning ? '同步執行中' : '執行中'}</Text>}
           </Text>
           <Button
             key="add"
@@ -454,6 +689,27 @@ export const register: Register = on => {
                 />
               </Box>
             ))}
+            {/* 執行中的進度條：模型用 progress 工具回報百分比；右側是工具呼叫次數 */}
+            {task.status === 'running' && (
+              <Box flexDirection="column" marginTop={1}>
+                <Box gap={1}>
+                  <Text color="claude">
+                    {progressBar(task.progress?.percent ?? 0, Math.min(40, width - 16)).filled}
+                    <Text dimColor>{progressBar(task.progress?.percent ?? 0, Math.min(40, width - 16)).empty}</Text>
+                  </Text>
+                  <Text weight="semibold">{task.progress?.percent ?? 0}%</Text>
+                  <Text dimColor size="caption">🔧 {task.toolCalls ?? 0}</Text>
+                </Box>
+                <Text dimColor size="caption">{task.progress?.note || '處理中…'}</Text>
+              </Box>
+            )}
+            {/* 同步模式：subagent 的回報 */}
+            {task.result && (
+              <Box flexDirection="column" marginTop={1}>
+                <Text dimColor>回報</Text>
+                <Text size="caption" wrap="wrap">{task.result}</Text>
+              </Box>
+            )}
             {fDraft?.id === task.id && (
               <Input
                 key={`file-path-${task.id}`}
@@ -475,11 +731,27 @@ export const register: Register = on => {
 
         {/* 底部動作列 */}
         <Box justifyContent="space-between" alignItems="center">
-          {running ? (
-            <Button key="stop" variant="secondary" label="■ 停止" onPress={() => stop($)} />
-          ) : (
-            <Button key="start" variant="primary" label="▶ 啟動任務" onPress={() => start($)} />
-          )}
+          <Box gap={1} alignItems="center">
+            {running ? (
+              <Button key="stop" variant="secondary" label="■ 停止" onPress={() => stop($)} />
+            ) : (
+              <Button key="start" variant="primary" label="▶ 啟動任務" onPress={() => start($)} />
+            )}
+            {/* 執行順序：線性 = 一張接一張交給主模型；同步 = 每張各派一個 subagent 同時跑 */}
+            {running ? (
+              <Text dimColor size="caption">{RUN_MODE_LABEL[mode]}</Text>
+            ) : (
+              <Select
+                key="run-mode"
+                label="執行順序"
+                options={RUN_MODE_OPTIONS}
+                value={mode}
+                onSelect={v => {
+                  if (isRunMode(v)) void update($, runMode, () => v)
+                }}
+              />
+            )}
+          </Box>
           {list.some(t => t.status !== 'pending') && !running ? (
             // 保留卡片內容，只把狀態全部回到待處理，之後再按啟動就會重跑
             <Button
@@ -487,7 +759,7 @@ export const register: Register = on => {
               variant="secondary"
               label="↻ 重置任務"
               onPress={async () => {
-                await update($, tasks, l => l.map(t => ({ ...t, status: 'pending' })))
+                await update($, tasks, l => l.map(t => ({ ...t, status: 'pending', result: undefined, progress: undefined, toolCalls: undefined })))
                 $.ui.toast('已重置，按 ▶ 啟動任務 可再跑一次')
               }}
             />

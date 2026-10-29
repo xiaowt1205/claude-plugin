@@ -8,7 +8,7 @@ const PANE = {
     isFocused: true,
     bodyColumns: 60,
     placement: 'inline',
-    scroll: { top: 0, bodyRows: 30 },
+    scroll: { top: 0, offset: 0, bodyRows: 30 },
     view: {},
   },
 } as const
@@ -155,4 +155,102 @@ test('a card can attach file paths, which are listed in its task prompt', async 
 
   await ui.press({ key: `rm-file-${id}-0` })
   expect(await ui.find({ type: 'Text', text: 'src/foo.ts' })).toBeUndefined()
+})
+
+test('parallel mode spawns one subagent per card and summarizes once all report back', async ($, on) => {
+  const submitted: string[] = []
+  on('prompt.submit', async (_, e) => {
+    submitted.push(e.text)
+    return { text: e.text }
+  })
+  const spawned: string[] = []
+  on('agent.spawn', async (_, e) => {
+    spawned.push(e.prompt)
+    return { model: 'm', agentId: `agent-${spawned.length}` }
+  })
+  on('turn.start', async (_, e) => ({ turnId: e.turnId }))
+  on('turn.complete', async (_, e) => ({ text: e.answer }))
+
+  const ui = await $.ui.mount({ plugin: 'todo-tasks', surface: 'desktop', ...PANE })
+  await ui.press({ key: 'add' })
+  await ui.press({ key: 'add' })
+  const titles = (await ui.findAll({ type: 'Input' })).filter(i => i.key?.startsWith('title-'))
+  await ui.input({ key: titles[0]!.key!, text: '任務 A', kind: 'change' })
+  await ui.input({ key: titles[1]!.key!, text: '任務 B', kind: 'change' })
+
+  // 預設線性，切成同步
+  expect(await ui.find({ key: 'run-mode' })).toBeDefined()
+  await ui.select({ key: 'run-mode', value: 'parallel' })
+
+  await ui.press({ key: 'start' })
+  expect(spawned.length).toBe(2)
+  expect(submitted.length).toBe(0)
+  expect(spawned[0]).toContain('任務 1/2')
+  expect(spawned[0]).toContain('任務 A')
+  expect(spawned[1]).toContain('任務 2/2')
+  expect(spawned[1]).toContain('任務 B')
+  expect(await ui.find({ key: 'stop' })).toBeDefined()
+
+  // 測試裡的 agent.spawn 給不了 agentId：由 subagent 的 turn.start（訊息帶卡片標記）對應
+  await $.turn.start({ text: spawned[0]!, turnId: 'turn-a', agentId: 'agent-1' })
+  await $.turn.start({ text: spawned[1]!, turnId: 'turn-b', agentId: 'agent-2' })
+
+  // 第二個先回報：只有一張完成，還沒彙整
+  await $.turn.complete({
+    reason: 'answer',
+    answer: 'B 做完了',
+    durationMs: 10,
+    isAborted: false,
+    turnId: 'turn-b',
+    agentId: 'agent-2',
+  })
+  expect(submitted.length).toBe(0)
+  expect(await ui.find({ type: 'Text', text: /1\/2 完成/ })).toBeDefined()
+
+  await $.turn.complete({
+    reason: 'answer',
+    answer: 'A 做完了',
+    durationMs: 10,
+    isAborted: false,
+    turnId: 'turn-a',
+    agentId: 'agent-1',
+  })
+  expect(submitted.length).toBe(1)
+  expect(submitted[0]).toContain('同步執行結果')
+  expect(submitted[0]).toContain('A 做完了')
+  expect(submitted[0]).toContain('B 做完了')
+  expect(await ui.find({ key: 'start' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /2\/2 完成/ })).toBeDefined()
+})
+
+test('a running card shows a progress bar fed by the progress tool and counts tool calls', async ($, on) => {
+  on('prompt.submit', async (_, e) => ({ text: e.text }))
+  on('tool.call', async () => ({ result: 'x', text: 'x' }))
+  on('turn.complete', async (_, e) => ({ text: e.answer }))
+
+  const ui = await $.ui.mount({ plugin: 'todo-tasks', surface: 'desktop', ...PANE })
+  await ui.press({ key: 'add' })
+  expect(await ui.find({ type: 'Text', text: /0%/ })).toBeUndefined()
+
+  await ui.press({ key: 'start' })
+  expect(await ui.find({ type: 'Text', text: /0%/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /🔧 0/ })).toBeDefined()
+
+  // 一般工具呼叫 → 計數 +1
+  await $.tool.call({ tool: 'Read', file_path: 'a.ts' })
+  expect(await ui.find({ type: 'Text', text: /🔧 1/ })).toBeDefined()
+
+  // 進度工具 → 百分比與說明
+  const r = await $.tool.call({ tool: 'mcp__todo-tasks__progress', percent: 60, note: '修改中' })
+  expect(r.isError).toBeUndefined()
+  expect(await ui.find({ type: 'Text', text: /60%/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: '修改中' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /🔧 1/ })).toBeDefined()
+
+  const bad = await $.tool.call({ tool: 'mcp__todo-tasks__progress', percent: 'abc' })
+  expect(bad.isError).toBe(true)
+
+  await $.turn.complete({ reason: 'answer', answer: 'ok', durationMs: 1, isAborted: false, turnId: 't1' })
+  expect(await ui.find({ type: 'Text', text: /60%/ })).toBeUndefined()
+  expect(await ui.find({ type: 'Text', text: /1\/1 完成/ })).toBeDefined()
 })
