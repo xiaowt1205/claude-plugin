@@ -1,6 +1,6 @@
 {
   "name": "todo-tasks",
-  "version": "0.3.4",
+  "version": "0.4.0",
   "description": "任務卡片佇列：設定處理規範，新增任務卡片（標題＋內容），啟動後依序逐一交給模型處理，或同步派給多個 subagent 並行處理",
   "types": "./types/index.d.ts"
 }

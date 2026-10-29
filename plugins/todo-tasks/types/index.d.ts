@@ -3,6 +3,9 @@ export type TaskStatus = 'pending' | 'running' | 'done' | 'failed'
 // 執行順序：線性 = 一張接一張交給主模型；同步 = 啟動時每張卡片各派一個 subagent 同時處理
 export type RunMode = 'linear' | 'parallel'
 
+// Skill 收藏：跨 session 保留（$.store）。target 是 skill 路徑，或 `/名稱` 形式的既有 skill 指令
+export type Favorite = { name: string; target: string }
+
 export type Task = {
   id: string
   title: string
@@ -24,6 +27,10 @@ declare module 'claude-code' {
       rules: string
       skills: string[]
       skillDraft: string | null
+      // Skill 收藏（$.store 的鏡像）、是否展開、登錄中的欄位
+      favorites: Favorite[]
+      favOpen: boolean
+      favDraft: Favorite | null
       // 正在為哪張卡片輸入附加檔案路徑
       fileDraft: { id: string; text: string } | null
       tasks: Task[]

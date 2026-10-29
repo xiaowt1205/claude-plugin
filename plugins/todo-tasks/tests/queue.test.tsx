@@ -1,4 +1,4 @@
-import { expect, mock, test } from 'claude-code/testing'
+import { expect, test } from 'claude-code/testing'
 
 const PANE = {
   component: 'Pane',
@@ -284,4 +284,59 @@ test('a running card shows a progress bar fed by the progress tool and counts to
   await $.turn.complete({ reason: 'answer', answer: 'ok', durationMs: 1, isAborted: false, turnId: 't1' })
   expect(await ui.find({ type: 'Text', text: /60%/ })).toBeUndefined()
   expect(await ui.find({ type: 'Text', text: /1\/1 完成/ })).toBeDefined()
+})
+
+test('skill favorites persist in the store, append @name to the rules, and reach the prompt only when referenced', async ($, on) => {
+  const submitted: string[] = []
+  on('prompt.submit', async (_, e) => {
+    submitted.push(e.text)
+    return { text: e.text }
+  })
+  // 上個 session 留下的收藏：session.start 從 $.store 讀回來；測試的 $ 沒有 store 名詞，
+  // 所以自己答 store.get / store.set，順便看寫了什麼
+  const stored: Record<string, unknown> = { favorites: [{ name: 'review', target: '/code-review' }] }
+  on('store.get', (_, e) => ({ value: stored[e.key] }))
+  on('store.set', (_, e) => {
+    stored[e.key] = e.value
+    return { value: undefined }
+  })
+  on('tool.register', (_, e) => ({ value: { tool: e.name } }))
+  on('command.register', (_, e) => ({ value: { command: e.name } }))
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+
+  const ui = await $.ui.mount({ plugin: 'todo-tasks', surface: 'desktop', ...PANE })
+  expect(await ui.find({ key: 'fav-0', text: '@review' })).toBeDefined()
+
+  // 登錄：名稱留空 → 用資料夾名稱；寫回 $.store
+  await ui.press({ key: 'add-fav' })
+  await ui.input({ key: 'fav-target', text: '".claude/skills/my-skill/SKILL.md"' })
+  expect(await ui.find({ key: 'fav-1', text: '@my-skill' })).toBeDefined()
+  expect(await ui.find({ key: 'fav-target' })).toBeUndefined()
+  expect(stored.favorites).toEqual([
+    { name: 'review', target: '/code-review' },
+    { name: 'my-skill', target: '.claude/skills/my-skill/SKILL.md' },
+  ])
+
+  // 按名稱 → 補到規範末尾，與 session skill 同一條路
+  await ui.press({ key: 'fav-0' })
+  expect((await ui.find({ key: 'rules' }))?.text).toBe('@review')
+
+  // 只有規範裡 @ 到的收藏才進對照表
+  await ui.press({ key: 'add' })
+  await ui.press({ key: 'start' })
+  expect(submitted[0]).toContain('@review → /code-review')
+  expect(submitted[0]).not.toContain('@my-skill')
+  await ui.press({ key: 'stop' })
+
+  // 折疊：列只剩名稱摘要，狀態也進 $.store
+  await ui.press({ key: 'fav-toggle' })
+  expect(await ui.find({ key: 'fav-0' })).toBeUndefined()
+  expect(await ui.find({ type: 'Text', text: /@review/ })).toBeDefined()
+  expect(stored.favOpen).toBe(false)
+  await ui.press({ key: 'fav-toggle' })
+
+  await ui.press({ key: 'rm-fav-1' })
+  expect(await ui.find({ key: 'fav-1' })).toBeUndefined()
+  expect(stored.favorites).toEqual([{ name: 'review', target: '/code-review' }])
 })

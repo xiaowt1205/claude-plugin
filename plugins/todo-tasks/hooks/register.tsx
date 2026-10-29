@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 
-import type { RunMode, Task } from '../types'
+import type { Favorite, RunMode, Task } from '../types'
 
 const PLUGIN = 'todo-tasks'
 const PANE = 'todo-tasks'
@@ -11,6 +11,10 @@ const rules = atom({ plugin: 'todo-tasks', key: 'rules' } as const, '')
 const skills = atom({ plugin: 'todo-tasks', key: 'skills' } as const, [] as string[])
 // 正在輸入中的 skill 路徑；null = 沒有顯示輸入欄
 const skillDraft = atom({ plugin: 'todo-tasks', key: 'skillDraft' } as const, null as string | null)
+// Skill 收藏：跨 session 保留在 $.store（key 同名），atom 只是鏡像供面板讀
+const favorites = atom({ plugin: 'todo-tasks', key: 'favorites' } as const, [] as Favorite[])
+const favOpen = atom({ plugin: 'todo-tasks', key: 'favOpen' } as const, true)
+const favDraft = atom({ plugin: 'todo-tasks', key: 'favDraft' } as const, null as Favorite | null)
 // 正在為哪張卡片輸入附加檔案路徑；null = 沒有顯示輸入欄
 const fileDraft = atom(
   { plugin: 'todo-tasks', key: 'fileDraft' } as const,
@@ -67,6 +71,16 @@ async function load($: $) {
   // hot-reload 時舊卡片可能沒有 files 欄位（state 跨重載保留）：補上
   await update($, tasks, l => l.map(t => ({ ...t, files: t.files ?? [] })))
   if (await read($, isInitialized)) return
+  // 收藏是跨 session 的：從 $.store 讀回來
+  const saved = await $.store.get('favorites')
+  await update($, favorites, () =>
+    Array.isArray(saved)
+      ? saved.filter((f): f is Favorite => typeof f?.name === 'string' && typeof f?.target === 'string')
+      : [],
+  )
+  const open = (await $.store.get('favOpen')) !== false
+  await update($, favOpen, () => open)
+  await update($, favDraft, () => null)
   await update($, isPaneSeen, () => false)
   await update($, rules, () => '')
   await update($, skills, () => [])
@@ -118,17 +132,40 @@ function skillName(path: string) {
   return parts[parts.length - 1]!.replace(/\.md$/i, '')
 }
 
-// 規範文字 + 已登錄的 skill 對照表（@名稱 → 路徑）；兩者皆空則回空字串
-function rulesText(ruleText: string, skillList: string[]) {
+// 規範文字 + skill 對照表（@名稱 → 路徑或指令）；兩者皆空則回空字串
+// 對照表 = 本 session 登錄的 skill + 規範裡有 @ 到的收藏（沒被引用的收藏不進 prompt）
+function rulesText(ruleText: string, skillList: string[], favs: Favorite[] = []) {
   const parts: string[] = []
-  if (ruleText.trim()) parts.push(ruleText.trim())
-  if (skillList.length) {
+  const text = ruleText.trim()
+  if (text) parts.push(text)
+  const lines = [
+    ...skillList.map(p => `- @${skillName(p)} → ${p}`),
+    ...favs.filter(f => text.includes(`@${f.name}`)).map(f => `- @${f.name} → ${f.target}`),
+  ]
+  if (lines.length) {
     parts.push(
-      '可用的 skill（規範中以 @名稱 引用，處理任務前先讀取對應檔案）：\n' +
-        skillList.map(p => `- @${skillName(p)} → ${p}`).join('\n'),
+      '可用的 skill（規範中以 @名稱 引用；對應到路徑的處理任務前先讀取該檔案，對應到 /指令 的用 Skill 工具呼叫該 skill）：\n' +
+        lines.join('\n'),
     )
   }
   return parts.join('\n\n')
+}
+
+// 讀規範 + session skill + 收藏，組成要給模型的規範文字
+async function currentRules($: $) {
+  return rulesText(await read($, rules), await read($, skills), await read($, favorites))
+}
+
+// 收藏的寫入都走這裡：atom 與 $.store 同步
+async function setFavorites($: $, fn: (l: Favorite[]) => Favorite[]) {
+  await update($, favorites, fn)
+  await $.store.set('favorites', await read($, favorites))
+}
+
+// 在規範末尾補上 @名稱（session skill 與收藏都用同一條路）
+function appendRef($: $, name: string) {
+  const ref = `@${name}`
+  return update($, rules, v => (v.trimEnd() ? `${v.trimEnd()} ${ref}` : ref))
 }
 
 function buildPrompt(ruleText: string, task: Task, index: number, total: number, mode: RunMode = 'linear') {
@@ -185,7 +222,7 @@ function progressBar(percent: number, cells: number) {
 async function startParallel($: $) {
   const list = await read($, tasks)
   const pending = list.filter(t => t.status === 'pending')
-  const ruleText = rulesText(await read($, rules), await read($, skills))
+  const ruleText = await currentRules($)
   await update($, agentMap, () => ({}))
   await update($, tasks, l =>
     l.map(t => (t.status === 'pending' ? { ...t, ...startFields() } : t)),
@@ -246,7 +283,7 @@ async function runNext($: $): Promise<boolean> {
   await update($, tasks, l => l.map(t => (t.id === task.id ? { ...t, ...startFields() } : t)))
   $.ui.status(`任務 ${index + 1}/${list.length}：${task.title || '（未命名）'}`)
   void $.prompt.submit({
-    text: buildPrompt(rulesText(await read($, rules), await read($, skills)), task, index, list.length),
+    text: buildPrompt(await currentRules($), task, index, list.length),
     asUser: true,
   })
   return true
@@ -354,7 +391,7 @@ export const register: Register = on => {
   // 規範進系統提示：每個新 session 都會先知道處理規範
   on('prompt.compose', async ($, e, next) => {
     const { sections } = await next(e)
-    const text = rulesText(await read($, rules), await read($, skills))
+    const text = await currentRules($)
     if (!text) return { sections }
     return {
       sections: [
@@ -510,6 +547,9 @@ export const register: Register = on => {
     const skillList = await read($, skills)
     const draft = await read($, skillDraft)
     const fDraft = await read($, fileDraft)
+    const favList = await read($, favorites)
+    const favsOpen = await read($, favOpen)
+    const favD = await read($, favDraft)
     const width = Math.max(20, e.props.bodyColumns - 2)
     const done = list.filter(t => t.status === 'done').length
 
@@ -552,6 +592,16 @@ export const register: Register = on => {
     const setTask = (id: string, patch: Partial<Task>) =>
       update($, tasks, l => l.map(t => (t.id === id ? { ...t, ...patch } : t)))
 
+    // 登錄收藏：名稱留空 = 用資料夾名稱（同 session skill）；路徑/指令空白就維持輸入狀態
+    const commitFav = async (patch: Partial<Favorite>) => {
+      const d = { ...(await read($, favDraft)), ...patch }
+      const target = cleanPath(d.target ?? '')
+      if (!target) return
+      const name = (d.name ?? '').trim() || skillName(target)
+      await setFavorites($, l => [...l, { name, target }])
+      await update($, favDraft, () => null)
+    }
+
     return (
       <Box flexDirection="column" width={width} gap={1}>
         {/* 處理規範：常駐輸入欄，邊打邊存 */}
@@ -585,11 +635,7 @@ export const register: Register = on => {
                 key={`skill-${i}`}
                 variant="secondary"
                 label={`@${skillName(path)}`}
-                onPress={() => {
-                  // 按下 → 在規範末尾補上 @名稱
-                  const name = `@${skillName(path)}`
-                  return update($, rules, v => (v.trimEnd() ? `${v.trimEnd()} ${name}` : name))
-                }}
+                onPress={() => appendRef($, skillName(path))}
               />
               <Text dimColor size="caption" wrap="truncate-start">
                 {path}
@@ -618,6 +664,73 @@ export const register: Register = on => {
                 await update($, skillDraft, () => null)
               }}
             />
+          )}
+        </Box>
+
+        {/* Skill 收藏：跨 session 保留，可折疊；按名稱與 session skill 一樣補 @名稱到規範末尾 */}
+        <Box flexDirection="column" borderStyle="round" borderColor="subtle" paddingX={1} gap={0}>
+          <Box justifyContent="space-between" alignItems="center">
+            <Button
+              key="fav-toggle"
+              plain
+              label={`${favsOpen ? '▾' : '▸'} Skill 收藏`}
+              onPress={async () => {
+                await update($, favOpen, v => !v)
+                await $.store.set('favOpen', await read($, favOpen))
+              }}
+            />
+            {favsOpen && favD === null && (
+              <Button
+                key="add-fav"
+                variant="secondary"
+                label="＋ 登錄"
+                onPress={() => update($, favDraft, () => ({ name: '', target: '' }))}
+              />
+            )}
+          </Box>
+          {!favsOpen && (
+            <Text dimColor size="caption">{favList.length ? favList.map(f => `@${f.name}`).join('　') : '（空）'}</Text>
+          )}
+          {favsOpen && favList.length === 0 && favD === null && (
+            <Text dimColor size="caption">跨 session 保留；登錄後按名稱會補到規範末尾</Text>
+          )}
+          {favsOpen &&
+            favList.map((f, i) => (
+              <Box key={`fav-row-${i}`} alignItems="center" gap={1}>
+                <Button key={`fav-${i}`} variant="secondary" label={`@${f.name}`} onPress={() => appendRef($, f.name)} />
+                <Text dimColor size="caption" wrap="truncate-start">
+                  {f.target}
+                </Text>
+                <Button
+                  key={`rm-fav-${i}`}
+                  plain
+                  dimColor
+                  label="×"
+                  onPress={() => setFavorites($, l => l.filter((_, j) => j !== i))}
+                />
+              </Box>
+            ))}
+          {favsOpen && favD !== null && (
+            <Box key="fav-form" flexDirection="column">
+              <Input
+                key="fav-name"
+                label="名稱"
+                placeholder="留空＝用資料夾／指令名稱"
+                value={favD.name}
+                onInput={v => update($, favDraft, d => ({ ...(d ?? { target: '' }), name: v }))}
+                onSubmit={v => commitFav({ name: v })}
+              />
+              <Input
+                key="fav-target"
+                label="路徑或指令"
+                placeholder=".claude/skills/my-skill/SKILL.md 或 /my-skill"
+                value={favD.target}
+                submitLabel="登錄"
+                autoFocus
+                onInput={v => update($, favDraft, d => ({ ...(d ?? { name: '' }), target: v }))}
+                onSubmit={v => commitFav({ target: v })}
+              />
+            </Box>
           )}
         </Box>
 
