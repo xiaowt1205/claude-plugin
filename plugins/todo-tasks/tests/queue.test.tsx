@@ -220,6 +220,40 @@ test('parallel mode spawns one subagent per card and summarizes once all report 
   expect(await ui.find({ type: 'Text', text: /2\/2 完成/ })).toBeDefined()
 })
 
+test('parallel mode fails the cards the main model never dispatched instead of leaving them running', async ($, on) => {
+  const submitted: string[] = []
+  on('prompt.submit', async (_, e) => {
+    submitted.push(e.text)
+    return { text: e.text }
+  })
+  on('turn.start', async (_, e) => ({ turnId: e.turnId }))
+  on('turn.complete', async (_, e) => ({ text: e.answer }))
+
+  const ui = await $.ui.mount({ plugin: 'todo-tasks', surface: 'desktop', ...PANE })
+  for (let i = 0; i < 3; i++) await ui.press({ key: 'add' })
+  await ui.select({ key: 'run-mode', value: 'parallel' })
+  await ui.press({ key: 'start' })
+
+  // 主模型只派出前兩張，第三張自己吞掉了
+  const spawned = [...submitted[0]!.matchAll(/<task[^>]*>\n([\s\S]*?)\n<\/task>/g)].map(m => m[1]!)
+  expect(spawned.length).toBe(3)
+  await $.turn.start({ text: spawned[0]!, turnId: 'turn-a', agentId: 'agent-1' })
+  await $.turn.start({ text: spawned[1]!, turnId: 'turn-b', agentId: 'agent-2' })
+
+  // 派工 turn 結束：沒派出的那張立刻標失敗，已派出的照常等回報
+  await $.turn.complete({ reason: 'answer', answer: '派好了', durationMs: 10, isAborted: false, turnId: 'main' })
+  expect(await ui.find({ type: 'Text', text: /沒有派出 subagent/ })).toBeDefined()
+  expect(await ui.find({ key: 'stop' })).toBeDefined()
+
+  for (const [turnId, agentId] of [['turn-a', 'agent-1'], ['turn-b', 'agent-2']] as const) {
+    await $.turn.complete({ reason: 'answer', answer: '做完了', durationMs: 10, isAborted: false, turnId, agentId })
+  }
+  // 全部回報 → 收尾，沒有卡片還停在執行中
+  expect(await ui.find({ key: 'start' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /2\/3 完成/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /執行中/ })).toBeUndefined()
+})
+
 test('a running card shows a progress bar fed by the progress tool and counts tool calls', async ($, on) => {
   on('prompt.submit', async (_, e) => ({ text: e.text }))
   on('tool.call', async () => ({ result: 'x', text: 'x' }))

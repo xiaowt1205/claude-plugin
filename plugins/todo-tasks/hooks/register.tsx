@@ -214,12 +214,28 @@ async function startParallel($: $) {
   $.ui.toast(`已要求主模型同時派出 ${pending.length} 個 subagent`)
 }
 
+// 同步模式：還在「執行中」卻沒有任何 subagent 對應的卡片 → 主模型沒派出，標失敗
+async function failUndispatched($: $) {
+  const dispatched = new Set(Object.values(await read($, agentMap)))
+  const stuck = (await read($, tasks)).filter(t => t.status === 'running' && !dispatched.has(t.id))
+  if (!stuck.length) return 0
+  await update($, tasks, l =>
+    l.map(t =>
+      t.status === 'running' && !dispatched.has(t.id)
+        ? { ...t, status: 'failed', result: '主模型沒有派出 subagent 處理這張卡片' }
+        : t,
+    ),
+  )
+  return stuck.length
+}
+
 // 同步模式全部回報後收尾（總結由主模型在同一個 turn 內完成）
 async function finishParallel($: $) {
+  const stuck = await failUndispatched($)
   await update($, isRunning, () => false)
   await update($, agentMap, () => ({}))
   $.ui.status(undefined)
-  $.ui.toast('同步任務全部完成')
+  $.ui.toast(stuck ? `同步任務完成，${stuck} 張卡片沒有被派出` : '同步任務全部完成')
 }
 
 async function runNext($: $): Promise<boolean> {
@@ -445,18 +461,18 @@ export const register: Register = on => {
       if (!remaining) await finishParallel($)
       return result
     }
-    // 同步模式進行中，主迴圈的 turn（例如使用者另外打字）與卡片無關
-    if (Object.keys(await read($, agentMap)).length) return result
     if ((await read($, runMode)) === 'parallel') {
-      // 派工 turn 結束了卻沒有任何 subagent 對應到卡片：主模型沒照做，把還在跑的卡片標失敗
-      const stuck = (await read($, tasks)).filter(t => t.status === 'running')
-      if (!stuck.length) return result
-      await update($, tasks, l =>
-        l.map(t => (t.status === 'running' ? { ...t, status: 'failed', result: '主模型沒有派出 subagent 處理這張卡片' } : t)),
-      )
+      // 主迴圈的 turn 結束（派工 turn，或使用者另外打字）：派工已經發生過，
+      // 還在跑卻沒有 subagent 的卡片就是主模型沒派出的 → 標失敗；一個都沒派就直接停
+      const stuck = await failUndispatched($)
+      if (Object.keys(await read($, agentMap)).length) {
+        if (stuck) $.ui.toast(`同步模式：${stuck} 張卡片沒有被派出`)
+        return result
+      }
+      if (!stuck) return result
       await update($, isRunning, () => false)
       $.ui.status(undefined)
-      $.ui.toast(`同步模式：${stuck.length} 張卡片沒有被派出，佇列已停止`)
+      $.ui.toast(`同步模式：${stuck} 張卡片沒有被派出，佇列已停止`)
       return result
     }
     const list = await read($, tasks)
