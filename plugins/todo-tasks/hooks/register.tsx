@@ -538,7 +538,7 @@ export const register: Register = on => {
 
     return (
       <Box flexDirection="column" width={width} gap={1}>
-        {/* 處理規範：常駐輸入欄，Enter 儲存 */}
+        {/* 處理規範：常駐輸入欄，邊打邊存 */}
         <Box flexDirection="column" borderStyle="round" borderColor="subtle" paddingX={1} gap={0}>
           <Text weight="bold">處理規範</Text>
           <Input
@@ -546,12 +546,8 @@ export const register: Register = on => {
             placeholder={DEFAULT_RULES}
             value={ruleText}
             rows={autoRows(ruleText, width - 4, 2, 12)}
-            submitLabel="儲存"
             onInput={v => update($, rules, () => v)}
-            onSubmit={async v => {
-              await update($, rules, () => v)
-              $.ui.toast('規範已儲存')
-            }}
+            onSubmit={v => update($, rules, () => v)}
           />
           <Box justifyContent="space-between" alignItems="center" marginTop={1}>
             <Text weight="bold">Skill</Text>
