@@ -88,6 +88,13 @@ const PROGRESS_HINT =
   `處理過程中請用 ${PROGRESS_TOOL_FULL} 工具回報進度（percent 0～100 與一句 note），` +
   `至少在：開始分析後、主要修改完成、驗證/測試完成、回報結果前各呼叫一次。`
 
+function markedTaskId(text: string) {
+  const at = text.indexOf(TASK_MARK)
+  if (at < 0) return undefined
+  const end = text.indexOf(']', at)
+  return end < 0 ? undefined : text.slice(at + TASK_MARK.length, end)
+}
+
 const RUN_MODE_OPTIONS: readonly { value: RunMode; label: string }[] = [
   { value: 'linear', label: '線性' },
   { value: 'parallel', label: '同步' },
@@ -173,7 +180,8 @@ function progressBar(percent: number, cells: number) {
   return { filled: '█'.repeat(filled), empty: '░'.repeat(n - filled) }
 }
 
-// 同步模式：所有待處理卡片各派一個 subagent，同時開跑
+// 同步模式：由主模型在同一則回覆裡用 Agent 工具派出所有 subagent
+// （plugin 直接 $.agent.spawn 會被 auto mode 的分類器擋下：「沒有模型請求對應這個動作」）
 async function startParallel($: $) {
   const list = await read($, tasks)
   const pending = list.filter(t => t.status === 'pending')
@@ -184,58 +192,34 @@ async function startParallel($: $) {
   )
   $.ui.status(`同步處理 ${pending.length} 個任務…`)
 
-  let started = 0
-  for (const task of pending) {
+  const blocks = pending.map(task => {
     const index = list.findIndex(t => t.id === task.id)
-    const r = await $.agent.spawn({
-      prompt: buildPrompt(ruleText, task, index, list.length, 'parallel'),
-      description: `TodoTasks ${index + 1}/${list.length}：${task.title.trim() || '（未命名）'}`,
-      subagentType: 'general-purpose',
-    })
-    if (r.deny !== undefined) {
-      await update($, tasks, l =>
-        l.map(t => (t.id === task.id ? { ...t, status: 'failed', result: `無法啟動 subagent：${r.deny}` } : t)),
-      )
-      continue
-    }
-    // 引擎給了 agentId 就直接對應；沒有的話由 turn.start 依訊息裡的標記補上
-    const agentId = r.agentId
-    if (agentId) await update($, agentMap, m => ({ ...m, [agentId]: task.id }))
-    started++
-  }
-
-  if (started === 0) {
-    await update($, isRunning, () => false)
-    $.ui.status(undefined)
-    $.ui.toast('沒有任何 subagent 啟動，佇列已停止')
-    return
-  }
-  $.ui.toast(`已派出 ${started} 個 subagent 同時處理`)
+    return (
+      `<task n="${index + 1}" description="TodoTasks ${index + 1}/${list.length}：${task.title.trim() || '（未命名）'}">\n` +
+      buildPrompt(ruleText, task, index, list.length, 'parallel') +
+      `\n</task>`
+    )
+  })
+  void $.prompt.submit({
+    text:
+      `【TodoTasks 同步執行】\n\n` +
+      `請用 Agent 工具（subagent_type: general-purpose）**在同一則回覆中一次發出 ${pending.length} 個呼叫**，` +
+      `讓 ${pending.length} 個 subagent 同時處理下列任務：每個 <task> 對應一個 Agent 呼叫，` +
+      `prompt 請原封不動使用 <task> 內的全文（包含開頭的【TodoTasks 任務 i/N】標記行），description 用 <task> 的 description 屬性。` +
+      `不要自己動手做任務、不要分批、不要先讀檔案再派。` +
+      `全部 subagent 回報後，請彙整成一份簡短總結（每個任務一兩句：做了什麼、有無問題）。\n\n` +
+      blocks.join('\n\n'),
+    asUser: true,
+  })
+  $.ui.toast(`已要求主模型同時派出 ${pending.length} 個 subagent`)
 }
 
-// 同步模式全部回報後：把各 subagent 的結果彙整成一則訊息交給主模型總結
+// 同步模式全部回報後收尾（總結由主模型在同一個 turn 內完成）
 async function finishParallel($: $) {
-  const list = await read($, tasks)
-  const done = list.filter(t => t.status === 'done' || t.status === 'failed')
   await update($, isRunning, () => false)
   await update($, agentMap, () => ({}))
   $.ui.status(undefined)
   $.ui.toast('同步任務全部完成')
-  const report = done
-    .map((t, i) => {
-      const index = list.findIndex(x => x.id === t.id)
-      return (
-        `### ${index + 1}. ${t.title.trim() || '（未命名）'}（${STATUS_LABEL[t.status]}）\n` +
-        (t.result?.trim() || '（沒有回報內容）')
-      )
-    })
-    .join('\n\n')
-  void $.prompt.submit({
-    text:
-      `【TodoTasks 同步執行結果】\n\n以下是 ${done.length} 個任務各自由 subagent 同時處理後的回報。` +
-      `請彙整成一份簡短總結（每個任務一兩句：做了什麼、有無問題），不要重做任務。\n\n${report}`,
-    asUser: true,
-  })
 }
 
 async function runNext($: $): Promise<boolean> {
@@ -398,12 +382,26 @@ export const register: Register = on => {
     return next(e)
   })
 
+  // 同步模式：主模型派出的 subagent，prompt 帶卡片標記 → 記下 agentId ↔ 卡片
+  on('agent.spawn', async ($, e, next) => {
+    const r = await next(e)
+    if (!r.agentId || !(await read($, isRunning))) return r
+    const taskId = markedTaskId(e.prompt)
+    if (!taskId) return r
+    const list = await read($, tasks)
+    const map = await read($, agentMap)
+    if (list.find(t => t.id === taskId)?.status === 'running' && !Object.values(map).includes(taskId)) {
+      const agentId = r.agentId
+      await update($, agentMap, m => ({ ...m, [agentId]: taskId }))
+    }
+    return r
+  })
+
   // 同步模式：subagent 的第一個 turn 以我們的任務訊息開頭 → 記下 agentId ↔ 卡片
   on('turn.start', async ($, e, next) => {
     if (!e.agentId || !(await read($, isRunning))) return next(e)
-    const at = e.text.indexOf(TASK_MARK)
-    if (at < 0) return next(e)
-    const taskId = e.text.slice(at + TASK_MARK.length, e.text.indexOf(']', at))
+    const taskId = markedTaskId(e.text)
+    if (!taskId) return next(e)
     const list = await read($, tasks)
     const map = await read($, agentMap)
     const task = list.find(t => t.id === taskId)
@@ -449,6 +447,18 @@ export const register: Register = on => {
     }
     // 同步模式進行中，主迴圈的 turn（例如使用者另外打字）與卡片無關
     if (Object.keys(await read($, agentMap)).length) return result
+    if ((await read($, runMode)) === 'parallel') {
+      // 派工 turn 結束了卻沒有任何 subagent 對應到卡片：主模型沒照做，把還在跑的卡片標失敗
+      const stuck = (await read($, tasks)).filter(t => t.status === 'running')
+      if (!stuck.length) return result
+      await update($, tasks, l =>
+        l.map(t => (t.status === 'running' ? { ...t, status: 'failed', result: '主模型沒有派出 subagent 處理這張卡片' } : t)),
+      )
+      await update($, isRunning, () => false)
+      $.ui.status(undefined)
+      $.ui.toast(`同步模式：${stuck.length} 張卡片沒有被派出，佇列已停止`)
+      return result
+    }
     const list = await read($, tasks)
     const current = list.find(t => t.status === 'running')
     if (!current) return result

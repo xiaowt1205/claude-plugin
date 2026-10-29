@@ -163,11 +163,6 @@ test('parallel mode spawns one subagent per card and summarizes once all report 
     submitted.push(e.text)
     return { text: e.text }
   })
-  const spawned: string[] = []
-  on('agent.spawn', async (_, e) => {
-    spawned.push(e.prompt)
-    return { model: 'm', agentId: `agent-${spawned.length}` }
-  })
   on('turn.start', async (_, e) => ({ turnId: e.turnId }))
   on('turn.complete', async (_, e) => ({ text: e.answer }))
 
@@ -182,16 +177,19 @@ test('parallel mode spawns one subagent per card and summarizes once all report 
   expect(await ui.find({ key: 'run-mode' })).toBeDefined()
   await ui.select({ key: 'run-mode', value: 'parallel' })
 
+  // 啟動 → 一則派工訊息給主模型，要求同一則回覆派出兩個 Agent
   await ui.press({ key: 'start' })
-  expect(spawned.length).toBe(2)
-  expect(submitted.length).toBe(0)
-  expect(spawned[0]).toContain('任務 1/2')
-  expect(spawned[0]).toContain('任務 A')
-  expect(spawned[1]).toContain('任務 2/2')
-  expect(spawned[1]).toContain('任務 B')
+  expect(submitted.length).toBe(1)
+  expect(submitted[0]).toContain('同步執行')
+  expect(submitted[0]).toContain('任務 1/2')
+  expect(submitted[0]).toContain('任務 A')
+  expect(submitted[0]).toContain('任務 2/2')
+  expect(submitted[0]).toContain('任務 B')
   expect(await ui.find({ key: 'stop' })).toBeDefined()
 
-  // 測試裡的 agent.spawn 給不了 agentId：由 subagent 的 turn.start（訊息帶卡片標記）對應
+  // 主模型派出的 subagent：由其 turn.start（prompt 帶卡片標記）對應到卡片
+  const spawned = [...submitted[0]!.matchAll(/<task[^>]*>\n([\s\S]*?)\n<\/task>/g)].map(m => m[1]!)
+  expect(spawned.length).toBe(2)
   await $.turn.start({ text: spawned[0]!, turnId: 'turn-a', agentId: 'agent-1' })
   await $.turn.start({ text: spawned[1]!, turnId: 'turn-b', agentId: 'agent-2' })
 
@@ -204,7 +202,6 @@ test('parallel mode spawns one subagent per card and summarizes once all report 
     turnId: 'turn-b',
     agentId: 'agent-2',
   })
-  expect(submitted.length).toBe(0)
   expect(await ui.find({ type: 'Text', text: /1\/2 完成/ })).toBeDefined()
 
   await $.turn.complete({
@@ -215,10 +212,10 @@ test('parallel mode spawns one subagent per card and summarizes once all report 
     turnId: 'turn-a',
     agentId: 'agent-1',
   })
+  // 全部回報 → 收尾；總結由主模型在同一個 turn 完成，不再另送訊息
   expect(submitted.length).toBe(1)
-  expect(submitted[0]).toContain('同步執行結果')
-  expect(submitted[0]).toContain('A 做完了')
-  expect(submitted[0]).toContain('B 做完了')
+  expect(await ui.find({ type: 'Text', text: 'A 做完了' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: 'B 做完了' })).toBeDefined()
   expect(await ui.find({ key: 'start' })).toBeDefined()
   expect(await ui.find({ type: 'Text', text: /2\/2 完成/ })).toBeDefined()
 })
